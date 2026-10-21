@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PixelRAM Keyboard + Screen Lab</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0 auto;padding:18px;max-width:960px;background:#0b1020;
+color:#edf2ff;font:15px system-ui}
+h1{font-size:clamp(24px,5vw,36px)}
+p{color:#b8c6e0;line-height:1.5}
+.panel{padding:16px;margin:14px 0;background:#151e32;
+border:1px solid #34425e;border-radius:14px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.card{background:#0d1528;padding:12px;border-radius:9px}
+.card b{display:block;font-size:20px;margin-top:5px}
+label{display:block;margin:12px 0 6px}
+input,textarea,select,button{width:100%;padding:11px;border-radius:8px;
+border:1px solid #435777;background:#0d1528;color:white;font:inherit}
+textarea{resize:vertical}
+button{background:#2655d6;border:0;font-weight:650;cursor:pointer}
+button:disabled{opacity:.5}
+.status{padding:12px;background:#0d1528;border-radius:8px;
+overflow-wrap:anywhere;color:#8ff5d0}
+canvas{width:100%;height:auto;display:block;background:#050914;
+border:1px solid #34425e;border-radius:8px}
+.small{font-size:13px;color:#aebcda}
+#keys{min-height:95px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:8px;border-bottom:1px solid #34425e}
+.scroll{overflow-x:auto}
+.warn{border-left:3px solid #ffca72;padding-left:12px}
+</style>
+</head>
+<body>
+<h1>PixelRAM Keyboard + Screen Lab</h1>
+<p>Keyboard input → simulated byte-addressable memory → WebGL texture → screen.</p>
+
+<div class="panel">
+  <h2>System status</h2>
+  <div class="grid">
+    <div class="card">Simulated memory<b>1.978 MiB</b></div>
+    <div class="card">Memory banks<b>4 × 518,400 B</b></div>
+    <div class="card">Keyboard writes<b id="writes">0</b></div>
+    <div class="card">Next address<b id="next">2048</b></div>
+  </div>
+  <p id="renderer" class="status">Checking WebGL…</p>
+  <p id="timing" class="status">No frame rendered yet.</p>
+</div>
+
+<div class="panel">
+  <h2>1. Type into simulated memory</h2>
+  <p>Tap the capture area and type on your PrimeBook keyboard.
+     Each keypress writes a byte (or UTF-8 bytes for a character)
+     to a simulated PixelRAM address.</p>
+  <button id="focus">Focus keyboard capture</button>
+  <label for="keys">Keyboard capture area</label>
+  <textarea id="keys" placeholder="Tap here, then type to write bytes into simulated memory."></textarea>
+  <p id="lastKey" class="status">No keys recorded yet.</p>
+  <p class="small">Key writes start at address 2048. This is a software simulation only.</p>
+</div>
+
+<div class="panel">
+  <h2>2. Render pixel memory</h2>
+  <label for="pattern">Pattern to fill the simulated memory</label>
+  <select id="pattern">
+    <option value="gradient">Horizontal gradient</option>
+    <option value="bars">Color-level bars (grayscale)</option>
+    <option value="checker">Checkerboard</option>
+    <option value="waves">Wave pattern</option>
+    <option value="noise">Deterministic noise</option>
+  </select>
+  <p><button id="generate">Generate pattern and render</button></p>
+  <div id="progress" class="status">Ready. Generate a pattern or type into the keyboard capture area.</div>
+  <p><canvas id="screen" width="960" height="540"></canvas></p>
+</div>
+
+<div class="panel">
+  <h2>3. Read any simulated address</h2>
+  <label for="addr">Byte address (0–2,073,599)</label>
+  <input id="addr" type="number" min="0" max="2073599" value="2048">
+  <p><button id="read">Read byte</button></p>
+  <div id="readOut" class="status">No read performed.</div>
+
+  <label for="wordAddr">Aligned four-byte address</label>
+  <input id="wordAddr" type="number" min="0" max="2073596" step="4" value="2048">
+  <p><button id="readWord">Read 32-bit word</button></p>
+  <div id="wordOut" class="status">No word read performed.</div>
+
+  <h3>Most recent keyboard writes (last 10)</h3>
+  <p class="small">Only the 10 newest entries are kept in this history table. Older history rows are removed automatically; simulated memory is not cleared.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Key</th><th>Address</th><th>Bank</th><th>Hex byte</th></tr></thead>
+      <tbody id="history"><tr><td colspan="4">No writes yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel warn">
+  <b>Important limitation</b>
+  <p>Keyboard events can write values into this simulated memory, and WebGL can render a texture from those values. The time measurement below concerns browser-side preparation and submission, not exact GPU execution time.</p>
+  <p>The physical screen is not extra general-purpose RAM. This page does not change Android memory allocation, connect the Verilog design to Mali VRAM, or improve Roblox FPS.</p>
+</div>
+
+<script>
+"use strict";
+
+const WIDTH = 1920, HEIGHT = 1080, CAPACITY = WIDTH * HEIGHT;
+const DEPTH = CAPACITY / 4;
+const MAX_HISTORY = 10;
+const banks = Array.from({length:4}, () => new Uint8Array(DEPTH));
+const frameBytes = new Uint8Array(CAPACITY);
+const screen = document.getElementById("screen");
+const ctx = screen.getContext("2d");
+const progress = document.getElementById("progress");
+
+let gl = null, program = null, texture = null;
+let frameReady = false, keyWrites = 0, nextAddress = 2048;
+let history = [], renderTimer = null;
+
+function bankOf(address) {
+  return (address & 3) ^ ((address >>> 2) & 3);
+}
+
+function readByte(address) {
+  return banks[bankOf(address)][address >>> 2];
+}
+
+function writeByte(address, value) {
+  if (address < 0 || address >= CAPACITY) return;
+  banks[bankOf(address)][address >>> 2] = value & 255;
+}
+
+function shader(type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s) || "Shader compile failed");
+  }
+  return s;
+}
+
+function initGPU() {
+  gl = screen.getContext("webgl", {alpha:false, antialias:false});
+  if (!gl) throw new Error("WebGL unavailable");
+
+  const ext = gl.getExtension("WEBGL_debug_renderer_info");
+  let name = ext
+    ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)
+    : gl.getParameter(gl.RENDERER);
+
+  if (!name) name = "Renderer details hidden by browser";
+  document.getElementById("renderer").textContent =
+    "WebGL available. Reported renderer: " + name;
+
+  const vs = shader(gl.VERTEX_SHADER, `
+    attribute vec2 pos;
+    attribute vec2 uv;
+    varying vec2 texUV;
+    void main(){ gl_Position=vec4(pos,0.,1.); texUV=uv; }
+  `);
+
+  const fs = shader(gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    uniform sampler2D tex;
+    varying vec2 texUV;
+    void main(){
+      float c=texture2D(tex,texUV).r;
+      gl_FragColor=vec4(c,c,c,1.);
+    }
+  `);
+
+  program = gl.createProgram();
+  gl.attachShader(program,vs);
+  gl.attachShader(program,fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program,gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(program) || "Shader link failed");
+
+  gl.useProgram(program);
+  const vertices = new Float32Array([
+    -1,-1,0,1, 1,-1,1,1, -1,1,0,0, 1,1,1,0
+  ]);
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+  gl.bufferData(gl.ARRAY_BUFFER,vertices,gl.STATIC_DRAW);
+
+  const pos = gl.getAttribLocation(program,"pos");
+  const uv = gl.getAttribLocation(program,"uv");
+  gl.enableVertexAttribArray(pos);
+  gl.vertexAttribPointer(pos,2,gl.FLOAT,false,16,0);
+  gl.enableVertexAttribArray(uv);
+  gl.vertexAttribPointer(uv,2,gl.FLOAT,false,16,8);
+
+  texture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,texture);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+  gl.uniform1i(gl.getUniformLocation(program,"tex"),0);
+}
+
+function updateStats() {
+  document.getElementById("writes").textContent = keyWrites.toLocaleString();
+  document.getElementById("next").textContent = nextAddress.toLocaleString();
+}
+
+function redrawHistory() {
+  document.getElementById("history").innerHTML = history.length
+    ? history.slice().reverse().map(h =>
+      `<tr><td>${escapeHTML(h.key)}</td><td>${h.address}</td>`+
+      `<td>${h.bank}</td><td>0x${h.value.toString(16).padStart(2,"0").toUpperCase()}</td></tr>`
+    ).join("")
+    : '<tr><td colspan="4">No writes yet.</td></tr>';
+}
+
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function storeKeyValue(key, value) {
+  const address = nextAddress;
+  writeByte(address, value);
+  nextAddress = (nextAddress + 1) % CAPACITY;
+  keyWrites++;
+
+  history.push({key, address, bank:bankOf(address), value:value & 255});
+  while (history.length > MAX_HISTORY) history.shift();
+
+  updateStats();
+  redrawHistory();
+
+  document.getElementById("lastKey").textContent =
+    "Key: " + key + " | Address: " + address +
+    " | Bank: " + bankOf(address) +
+    " | Row: " + Math.floor(address / 4) +
+    " | Byte: 0x" + (value & 255).toString(16).padStart(2,"0").toUpperCase();
+
+  // Batch visual updates instead of uploading the full texture per key.
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => {
+    if (frameReady) renderFromMemory();
+  }, 180);
+}
+
+document.getElementById("focus").addEventListener("click", () => {
+  document.getElementById("keys").focus();
+});
+
+document.getElementById("keys").addEventListener("keydown", event => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.repeat) return;
+
+  let value, label = event.key;
+
+  if (event.key.length === 1) {
+    const encoded = new TextEncoder().encode(event.key);
+    for (const b of encoded) storeKeyValue(event.key, b);
+    event.preventDefault();
+    return;
+  }
+
+  const special = {
+    "Enter":13, "Backspace":8, "Tab":9, "Escape":27,
+    "ArrowLeft":128, "ArrowUp":129, "ArrowRight":130, "ArrowDown":131,
+    "Delete":127, "Home":132, "End":133, "PageUp":134, "PageDown":135
+  };
+
+  if (Object.prototype.hasOwnProperty.call(special,event.key)) {
+    value = special[event.key];
+  } else {
+    // Stable small hash for function and other non-character keys.
+    let hash = 0;
+    for (const ch of event.code) hash = (hash * 31 + ch.charCodeAt(0)) & 255;
+    value = hash;
+    label = event.code || event.key;
+  }
+
+  storeKeyValue(label,value);
+
+  if (event.key === "Tab") event.preventDefault();
+});
+
+function makePattern(kind,x,y,address) {
+  switch(kind) {
+    case "bars":
+      return [24,55,87,119,151,183,215,247][Math.min(7,Math.floor(x*8/WIDTH))];
+    case "gradient":
+      return Math.floor(x*255/(WIDTH-1));
+    case "checker":
+      return ((Math.floor(x/32)+Math.floor(y/32))&1) ? 238 : 22;
+    case "waves":
+      return Math.round(127.5+127.5*Math.sin(x*.025+y*.045));
+    case "noise":
+      return (Math.imul(address+1,1664525)+1013904223) >>> 24;
+    default:
+      return 0;
+  }
+}
+
+async function generatePattern() {
+  const button = document.getElementById("generate");
+  button.disabled = true;
+  const kind = document.getElementById("pattern").value;
+
+  try {
+    for (let start=0; start<CAPACITY; start+=32768) {
+      const end = Math.min(start+32768,CAPACITY);
+      for (let a=start; a<end; a++) {
+        const x = a % WIDTH, y = Math.floor(a/WIDTH);
+        writeByte(a,makePattern(kind,x,y,a));
+      }
+      progress.textContent =
+        "Filling simulated memory: "+(100*end/CAPACITY).toFixed(1)+"%";
+      await new Promise(resolve=>setTimeout(resolve,0));
+    }
+
+    frameReady = true;
+    renderFromMemory();
+    progress.textContent = "Pattern filled across all 2,073,600 bytes and rendered.";
+  } catch (e) {
+    progress.textContent = "Render error: "+e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderFromMemory() {
+  const t0 = performance.now();
+
+  for (let a=0; a<CAPACITY; a++) frameBytes[a] = readByte(a);
+
+  if (gl) {
+    gl.viewport(0,0,screen.width,screen.height);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE,
+      WIDTH,HEIGHT,0,gl.LUMINANCE,gl.UNSIGNED_BYTE,frameBytes);
+    gl.clearColor(0,0,0,1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  } else {
+    const image = ctx.createImageData(screen.width,screen.height);
+    let p=0;
+    for (let y=0;y<screen.height;y++) {
+      for (let x=0;x<screen.width;x++) {
+        const v=readByte((y*2)*WIDTH+x*2);
+        image.data[p++]=v; image.data[p++]=v;
+        image.data[p++]=v; image.data[p++]=255;
+      }
+    }
+    ctx.putImageData(image,0,0);
+  }
+
+  const elapsed = performance.now()-t0;
+  document.getElementById("timing").textContent =
+    "Frame preparation + upload/draw submission: "+elapsed.toFixed(2)+
+    " ms (browser-side measurement; not exact GPU execution time).";
+  progress.textContent = "Rendered. Keyboard data remains in simulated memory.";
+}
+
+document.getElementById("generate").addEventListener("click",generatePattern);
+
+document.getElementById("read").addEventListener("click",() => {
+  const a = Number(document.getElementById("addr").value);
+  const out = document.getElementById("readOut");
+  if (!Number.isInteger(a)||a<0||a>=CAPACITY) {
+    out.textContent = "Address out of range."; return;
+  }
+  const v=readByte(a);
+  out.textContent = "Address "+a+" | Bank "+bankOf(a)+
+    " | Row "+Math.floor(a/4)+" | Decimal "+v+
+    " | Hex 0x"+v.toString(16).padStart(2,"0").toUpperCase();
+});
+
+document.getElementById("readWord").addEventListener("click",() => {
+  const a=Number(document.getElementById("wordAddr").value);
+  const out=document.getElementById("wordOut");
+  if (!Number.isInteger(a)||a<0||a%4!==0||a+3>=CAPACITY) {
+    out.textContent="Use an aligned address from 0 through 2,073,596.";
+    return;
+  }
+  const b=[0,1,2,3].map(i=>readByte(a+i));
+  const hex=b.slice().reverse().map(v=>
+    v.toString(16).padStart(2,"0")).join("").toUpperCase();
+  out.textContent="Address "+a+" | Bytes: "+
+    b.map(v=>"0x"+v.toString(16).padStart(2,"0").toUpperCase()).join(", ")+ 
+    " | 32-bit word: 0x"+hex;
+});
+
+try {
+  initGPU();
+} catch(e) {
+  gl=null;
+  document.getElementById("renderer").textContent =
+    "WebGL unavailable; using Canvas 2D fallback: "+e.message;
+}
+updateStats();
+</script>
+</body>
+</html>
