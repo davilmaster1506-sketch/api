@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PixelRAM GPU Lab</title>
+<style>
+body{margin:0;padding:18px;background:#0b1020;color:#edf2ff;
+font:15px system-ui;max-width:900px;margin:auto}
+.panel{background:#151e32;border:1px solid #34425e;
+border-radius:14px;padding:16px;margin:14px 0}
+p{color:#b7c6e3;line-height:1.5}
+button,select,input{padding:11px;border-radius:8px;
+border:1px solid #455879;background:#0d1528;color:white;
+font:inherit;max-width:100%}
+button{background:#2454cf;border:0;font-weight:bold}
+input,select{width:100%;box-sizing:border-box}
+label{display:block;margin:12px 0 6px}
+canvas{width:100%;height:auto;display:block;background:#050914;
+border:1px solid #34425e;border-radius:8px}
+.status{padding:12px;border-radius:8px;background:#0d1528;
+overflow-wrap:anywhere;color:#8ff5d0}
+.small{font-size:13px;color:#aebcda}
+</style>
+</head>
+<body>
+<h1>PixelRAM GPU Lab</h1>
+<p>PixelRAM byte-array simulation → WebGL texture → browser graphics driver.</p>
+
+<div class="panel">
+  <h2>Graphics renderer</h2>
+  <div id="gpuStatus" class="status">Checking WebGL…</div>
+  <p class="small">The reported renderer comes from the browser. It may be
+  hardware accelerated or software rendered.</p>
+</div>
+
+<div class="panel">
+  <h2>Generate pixel data</h2>
+  <p>Four simulated banks · 2,073,600 bytes · 1920 × 1080 grayscale.</p>
+  <label for="pattern">Pattern</label>
+  <select id="pattern">
+    <option value="bars">Color-level bars</option>
+    <option value="gradient">Horizontal gradient</option>
+    <option value="checker">Checkerboard</option>
+    <option value="waves">Wave pattern</option>
+    <option value="noise">Deterministic noise</option>
+  </select>
+  <p><button id="generate">Generate and render on GPU</button></p>
+  <div id="progress" class="status">Ready.</div>
+  <p id="gpuCanvasWrap"><canvas id="gpuCanvas" width="960" height="540"></canvas></p>
+  <p id="fallbackWrap" hidden><canvas id="fallbackCanvas" width="960" height="540"></canvas></p>
+</div>
+
+<div class="panel">
+  <h2>Read simulated memory</h2>
+  <label for="byteAddress">Byte address: 0–2,073,599</label>
+  <input id="byteAddress" type="number" min="0" max="2073599" value="0">
+  <p><button id="readByte">Read byte</button></p>
+  <div id="byteResult" class="status">Generate a pattern first.</div>
+
+  <label for="wordAddress">Aligned four-byte address</label>
+  <input id="wordAddress" type="number" min="0" max="2073596" step="4" value="0">
+  <p><button id="readWord">Read 32-bit word</button></p>
+  <div id="wordResult" class="status">Generate a pattern first.</div>
+</div>
+
+<div class="panel">
+  <h2>What this proves</h2>
+  <p>When WebGL is available, this demo uploads data from the simulated
+  PixelRAM banks into a GPU texture and renders that texture. The browser
+  reports the graphics renderer above.</p>
+  <p><b>It does not connect the Verilog RTL to physical GPU memory or Roblox.</b>
+  A hardware connection still requires compatible hardware and system-driver
+  integration.</p>
+</div>
+
+<script>
+"use strict";
+
+const W = 1920, H = 1080, CAP = W * H, DEPTH = CAP / 4;
+const banks = Array.from({length:4}, () => new Uint8Array(DEPTH));
+const frame = new Uint8Array(CAP);
+
+const gpuCanvas = document.getElementById("gpuCanvas");
+const fallbackCanvas = document.getElementById("fallbackCanvas");
+const gpuStatus = document.getElementById("gpuStatus");
+const progress = document.getElementById("progress");
+
+let gl = null, program = null, texture = null, frameReady = false;
+let ctx2d = null;
+
+function bankOf(a) {
+  return (a & 3) ^ ((a >>> 2) & 3);
+}
+function readByte(a) {
+  return banks[bankOf(a)][a >>> 2];
+}
+function writeByte(a, v) {
+  banks[bankOf(a)][a >>> 2] = v & 255;
+}
+
+function makeShader(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const error = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error("Shader compilation failed: " + error);
+  }
+  return shader;
+}
+
+function initWebGL() {
+  gl = gpuCanvas.getContext("webgl", {
+    alpha: false, antialias: false, preserveDrawingBuffer: false
+  });
+  if (!gl) throw new Error("WebGL is unavailable in this browser.");
+
+  const maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  if (maxTexture < W || maxTexture < H) {
+    throw new Error("GPU texture limit is too small for 1920x1080.");
+  }
+
+  const vs = makeShader(gl.VERTEX_SHADER, `
+    attribute vec2 a_position;
+    attribute vec2 a_uv;
+    varying vec2 v_uv;
+    void main() {
+      gl_Position = vec4(a_position, 0.0, 1.0);
+      v_uv = a_uv;
+    }
+  `);
+
+  const fs = makeShader(gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    uniform sampler2D u_frame;
+    varying vec2 v_uv;
+    void main() {
+      float shade = texture2D(u_frame, v_uv).r;
+      gl_FragColor = vec4(shade, shade, shade, 1.0);
+    }
+  `);
+
+  program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error("Shader link failed: " + gl.getProgramInfoLog(program));
+  }
+
+  gl.useProgram(program);
+
+  const vertices = new Float32Array([
+    -1,-1, 0,1,
+     1,-1, 1,1,
+    -1, 1, 0,0,
+     1, 1, 1,0
+  ]);
+
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+  const position = gl.getAttribLocation(program, "a_position");
+  const uv = gl.getAttribLocation(program, "a_uv");
+
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(uv);
+  gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, 16, 8);
+
+  texture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.uniform1i(gl.getUniformLocation(program, "u_frame"), 0);
+
+  const ext = gl.getExtension("WEBGL_debug_renderer_info");
+  let renderer = ext
+    ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)
+    : gl.getParameter(gl.RENDERER);
+  if (!renderer) renderer = "Renderer name hidden by browser";
+
+  gpuStatus.textContent =
+    "WebGL active. Renderer reported by browser: " + renderer;
+
+  if (/swiftshader|llvmpipe|software raster/i.test(renderer)) {
+    gpuStatus.textContent += " — this appears to be software rendering.";
+  }
+
+  gpuCanvas.style.display = "block";
+  fallbackCanvas.style.display = "none";
+  document.getElementById("fallbackWrap").hidden = true;
+}
+
+function renderGPU() {
+  for (let a = 0; a < CAP; a++) frame[a] = readByte(a);
+
+  gl.viewport(0, 0, gpuCanvas.width, gpuCanvas.height);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+
+  // Upload simulated pixel bytes as a single-channel GPU texture.
+  gl.texImage2D(
+    gl.TEXTURE_2D, 0, gl.LUMINANCE,
+    W, H, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, frame
+  );
+
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function renderFallback() {
+  ctx2d = ctx2d || fallbackCanvas.getContext("2d");
+  const image = ctx2d.createImageData(fallbackCanvas.width,
+                                      fallbackCanvas.height);
+  let p = 0;
+  for (let y = 0; y < fallbackCanvas.height; y++) {
+    for (let x = 0; x < fallbackCanvas.width; x++) {
+      const v = readByte((y * 2) * W + x * 2);
+      image.data[p++] = v;
+      image.data[p++] = v;
+      image.data[p++] = v;
+      image.data[p++] = 255;
+    }
+  }
+  ctx2d.putImageData(image, 0, 0);
+}
+
+function patternValue(kind, x, y, a) {
+  switch (kind) {
+    case "bars":
+      return [24,55,87,119,151,183,215,247][Math.min(7, Math.floor(x*8/W))];
+    case "gradient":
+      return Math.floor(x*255/(W-1));
+    case "checker":
+      return ((Math.floor(x/32)+Math.floor(y/32))&1) ? 238 : 22;
+    case "waves":
+      return Math.round(127.5+127.5*Math.sin(x*0.025+y*0.045));
+    case "noise":
+      return (Math.imul(a+1,1664525)+1013904223) >>> 24;
+    default:
+      return 0;
+  }
+}
+
+async function generate() {
+  const button = document.getElementById("generate");
+  button.disabled = true;
+  frameReady = false;
+  const kind = document.getElementById("pattern").value;
+
+  try {
+    for (let start = 0; start < CAP; start += 32768) {
+      const end = Math.min(start + 32768, CAP);
+      for (let a = start; a < end; a++) {
+        const x = a % W, y = Math.floor(a / W);
+        writeByte(a, patternValue(kind, x, y, a));
+      }
+      progress.textContent =
+        "Writing simulated memory: " + (100*end/CAP).toFixed(1) + "%";
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    if (gl) renderGPU();
+    else renderFallback();
+
+    frameReady = true;
+    progress.textContent =
+      "Complete: 2,073,600 simulated bytes written and rendered.";
+  } catch (error) {
+    progress.textContent = "Render failed: " + error.message;
+    console.error(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById("generate").addEventListener("click", generate);
+
+document.getElementById("readByte").addEventListener("click", () => {
+  const a = Number(document.getElementById("byteAddress").value);
+  const out = document.getElementById("byteResult");
+
+  if (!frameReady) {
+    out.textContent = "Generate a pattern first.";
+  } else if (!Number.isInteger(a) || a < 0 || a >= CAP) {
+    out.textContent = "Address out of range.";
+  } else {
+    const v = readByte(a);
+    out.textContent = "Address " + a + " | Bank " + bankOf(a) +
+      " | Row " + Math.floor(a/4) + " | Decimal " + v +
+      " | Hex 0x" + v.toString(16).padStart(2,"0").toUpperCase();
+  }
+});
+
+document.getElementById("readWord").addEventListener("click", () => {
+  const a = Number(document.getElementById("wordAddress").value);
+  const out = document.getElementById("wordResult");
+
+  if (!frameReady) {
+    out.textContent = "Generate a pattern first.";
+    return;
+  }
+  if (!Number.isInteger(a) || a < 0 || a % 4 || a + 3 >= CAP) {
+    out.textContent = "Use an aligned address from 0 through 2,073,596.";
+    return;
+  }
+
+  const b = [readByte(a),readByte(a+1),readByte(a+2),readByte(a+3)];
+  const hex = b.slice().reverse().map(v =>
+    v.toString(16).padStart(2,"0")).join("").toUpperCase();
+
+  out.textContent = "Address " + a + " | Bytes: " +
+    b.map(v => "0x" + v.toString(16).padStart(2,"0").toUpperCase()).join(", ") +
+    " | 32-bit word: 0x" + hex;
+});
+
+try {
+  initWebGL();
+} catch (error) {
+  gl = null;
+  gpuCanvas.style.display = "none";
+  document.getElementById("fallbackWrap").hidden = false;
+  gpuStatus.textContent =
+    "WebGL unavailable: " + error.message +
+    " Canvas fallback selected; GPU use is not confirmed.";
+  console.warn(error);
+}
+</script>
+</body>
+</html>
