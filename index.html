@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PixelRAM Graphics Lab</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#edf2ff;
+font:15px system-ui, sans-serif}
+main{max-width:1100px;margin:auto;padding:20px}
+h1{margin:0;font-size:clamp(24px,5vw,38px)}
+p{line-height:1.5;color:#aebcda}
+.panel{background:#151e32;border:1px solid #293754;
+border-radius:16px;padding:17px;margin:16px 0}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.stat{background:#0d1528;border-radius:10px;padding:13px}
+.stat b{display:block;font-size:21px;margin-top:4px}
+label{display:block;margin:12px 0 6px;color:#cbd7f2}
+button,select,input{font:inherit;border-radius:9px;
+border:1px solid #3a4c70;padding:11px;background:#0d1528;color:#fff}
+button{background:#244fce;border:0;font-weight:650;cursor:pointer}
+button:disabled{opacity:.5}
+input,select{max-width:100%;width:100%}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+canvas{display:block;width:100%;height:auto;background:#050914;
+border-radius:10px;border:1px solid #34425e}
+.output{overflow-wrap:anywhere;background:#0d1528;
+padding:11px;border-radius:8px;color:#8ff5d0}
+.small{font-size:13px;color:#aebcda}
+.warning{border-left:3px solid #ffcb70;padding-left:12px}
+code{color:#a4d7ff}
+</style>
+</head>
+<body>
+<main>
+  <h1>PixelRAM Graphics Lab</h1>
+  <p>Software simulation of the PixelRAM four-bank design.</p>
+
+  <div class="panel">
+    <div class="stats">
+      <div class="stat">Simulated capacity<b>1.978 MiB</b></div>
+      <div class="stat">Memory banks<b>4 × 518,400 B</b></div>
+      <div class="stat">Frame format<b>1920 × 1080</b></div>
+      <div class="stat">Pixel format<b>8-bit grayscale</b></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Graphics output</h2>
+    <p class="small">Choose a pattern and generate a simulated frame.</p>
+    <label for="pattern">Test pattern</label>
+    <select id="pattern">
+      <option value="bars">Color-level bars</option>
+      <option value="gradient">Horizontal gradient</option>
+      <option value="checker">Checkerboard</option>
+      <option value="waves">Wave pattern</option>
+      <option value="noise">Deterministic noise</option>
+    </select>
+    <p><button id="generate">Generate and display pattern</button></p>
+    <div id="progress" class="output">Initializing simulation memory…</div>
+    <p><canvas id="screen" width="960" height="540"></canvas></p>
+    <p class="small">The preview is rendered from sampled bytes in the simulated banks.</p>
+  </div>
+
+  <div class="panel">
+    <h2>Read a byte</h2>
+    <label for="byteAddr">Byte address (0–2,073,599)</label>
+    <input id="byteAddr" type="number" min="0" max="2073599" value="0">
+    <p><button id="readByte">Read byte</button></p>
+    <div id="byteOut" class="output">Generate a pattern first.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Read four bytes</h2>
+    <label for="wordAddr">Aligned address (multiples of 4)</label>
+    <input id="wordAddr" type="number" min="0" max="2073596"
+           step="4" value="0">
+    <p><button id="readWord">Read 32-bit word</button></p>
+    <div id="wordOut" class="output">Generate a pattern first.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Address mapping</h2>
+    <p>For an address <code>a</code>, the prototype selects:</p>
+    <div class="output">row = floor(a / 4)<br>
+    bank = (a mod 4) XOR (floor(a / 4) mod 4)</div>
+    <p class="small">This mirrors the address mapping in PixelRAM v0.57.</p>
+  </div>
+
+  <div class="panel warning">
+    <b>Important</b>
+    <p>This is a browser-based software model. It does not connect to the
+    Mali GPU, replace system RAM, modify Roblox, or increase actual FPS.</p>
+  </div>
+</main>
+<script>
+(() => {
+  "use strict";
+
+  const W = 1920, H = 1080, CAP = W * H, DEPTH = CAP / 4;
+  const banks = Array.from({length:4}, () => new Uint8Array(DEPTH));
+  const canvas = document.getElementById("screen");
+  const ctx = canvas.getContext("2d");
+  const progress = document.getElementById("progress");
+  let generated = false;
+  let writeCount = 0;
+  let manualReads = 0;
+
+  function bankOf(a) {
+    return (a & 3) ^ ((a >>> 2) & 3);
+  }
+
+  function writeByteUnchecked(a, v) {
+    banks[bankOf(a)][a >>> 2] = v & 255;
+  }
+
+  function readByteUnchecked(a) {
+    return banks[bankOf(a)][a >>> 2];
+  }
+
+  function patternValue(kind, x, y, a) {
+    switch (kind) {
+      case "bars": {
+        const values = [24, 55, 87, 119, 151, 183, 215, 247];
+        return values[Math.min(7, Math.floor(x * 8 / W))];
+      }
+      case "gradient":
+        return Math.floor(x * 255 / (W - 1));
+      case "checker":
+        return ((Math.floor(x / 32) + Math.floor(y / 32)) & 1)
+          ? 238 : 22;
+      case "waves":
+        return Math.max(0, Math.min(255,
+          Math.round(127.5 + 127.5 * Math.sin(x * 0.025 + y * 0.045))));
+      case "noise":
+        return (Math.imul(a + 1, 1664525) + 1013904223) >>> 24;
+      default:
+        return 0;
+    }
+  }
+
+  function renderFrame() {
+    const image = ctx.createImageData(canvas.width, canvas.height);
+    let p = 0;
+    for (let y = 0; y < canvas.height; y++) {
+      const sourceY = y * 2;
+      for (let x = 0; x < canvas.width; x++) {
+        const sourceAddress = sourceY * W + x * 2;
+        const v = readByteUnchecked(sourceAddress);
+        image.data[p++] = v;
+        image.data[p++] = v;
+        image.data[p++] = v;
+        image.data[p++] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  }
+
+  async function generate() {
+    const button = document.getElementById("generate");
+    const kind = document.getElementById("pattern").value;
+    button.disabled = true;
+    generated = false;
+    writeCount = 0;
+    progress.textContent = "Generating pattern and writing simulated memory…";
+
+    // Work in chunks so the browser remains responsive.
+    let a = 0;
+    while (a < CAP) {
+      const end = Math.min(a + 32768, CAP);
+      for (; a < end; a++) {
+        const x = a % W;
+        const y = Math.floor(a / W);
+        writeByteUnchecked(a, patternValue(kind, x, y, a));
+      }
+      progress.textContent =
+        "Writing memory: " + (100 * a / CAP).toFixed(1) + "%";
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    writeCount = CAP;
+    generated = true;
+    renderFrame();
+    progress.textContent =
+      "Complete: " + writeCount.toLocaleString() +
+      " bytes written across four simulated banks.";
+    document.getElementById("byteOut").textContent =
+      "Pattern ready. Choose an address and read a byte.";
+    document.getElementById("wordOut").textContent =
+      "Pattern ready. Choose an aligned address and read four bytes.";
+    button.disabled = false;
+  }
+
+  function requirePattern() {
+    if (!generated) {
+      progress.textContent = "Generate a pattern before reading memory.";
+      return false;
+    }
+    return true;
+  }
+
+  document.getElementById("generate").addEventListener("click", generate);
+
+  document.getElementById("readByte").addEventListener("click", () => {
+    if (!requirePattern()) return;
+    const a = Number(document.getElementById("byteAddr").value);
+    if (!Number.isInteger(a) || a < 0 || a >= CAP) {
+      document.getElementById("byteOut").textContent = "Address out of range.";
+      return;
+    }
+    const value = readByteUnchecked(a);
+    manualReads++;
+    document.getElementById("byteOut").textContent =
+      "Address " + a + " | Bank " + bankOf(a) +
+      " | Row " + Math.floor(a / 4) +
+      " | Decimal " + value +
+      " | Hex 0x" + value.toString(16).padStart(2, "0").toUpperCase();
+  });
+
+  document.getElementById("readWord").addEventListener("click", () => {
+    if (!requirePattern()) return;
+    const a = Number(document.getElementById("wordAddr").value);
+    if (!Number.isInteger(a) || a < 0 || a % 4 !== 0 || a + 3 >= CAP) {
+      document.getElementById("wordOut").textContent =
+        "Use an aligned address from 0 through 2,073,596.";
+      return;
+    }
+    const b = [0,1,2,3].map(i => readByteUnchecked(a + i));
+    manualReads += 4;
+    const hex = b.slice().reverse().map(v =>
+      v.toString(16).padStart(2, "0")).join("").toUpperCase();
+    document.getElementById("wordOut").textContent =
+      "Address " + a + " | Little-endian bytes: " +
+      b.map(v => "0x" + v.toString(16).padStart(2, "0").toUpperCase()).join(", ") +
+      " | 32-bit word: 0x" + hex +
+      " | Four bytes read";
+  });
+
+  // Display an initial blank preview until a pattern is generated.
+  ctx.fillStyle = "#050914";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  progress.textContent =
+    "Ready. The memory contains " + CAP.toLocaleString() + " simulated bytes.";
+})();
+</script>
+</body>
+</html>
